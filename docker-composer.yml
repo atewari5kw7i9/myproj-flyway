@@ -1,0 +1,33 @@
+---
+version: "3.3"
+
+services:
+  snowflake:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.snowflake
+    env_file: .env
+  users:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.snowflake
+    entrypoint: ["python3", "/flyway/scripts/provisionUsers.py"]
+    env_file: .env
+  roles:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.snowflake
+    entrypoint: ["python3", "/flyway/scripts/provisionRoles.py"]
+    env_file: .env
+  databases:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.snowflake
+    entrypoint: ["python3", "/flyway/scripts/provisionDatabases.py"]
+    env_file: .env
+  warehouses:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.snowflake
+    entrypoint: ["python3", "/flyway/scripts/provisionWarehouses.py"]
+    env_file: .env
