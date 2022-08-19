@@ -1,0 +1,330 @@
+---
+version: 2.1
+
+variables:
+  - &nonprod-aws-region us-east-1
+  - &prod-aws-region us-east-1
+  - &team gda
+  - &circle-ci-context
+    context: grainger-apps-global
+  - &circle-ci-service-account
+    circle-ci-service-account: $SERVICE_USER_GDA
+
+orbs:
+  app-release: wwgrainger/app-release@9.0.0
+  common-tasks: wwgrainger/common-pipeline-tasks@5.1.0
+  compliance: wwgrainger/compliance-tasks@4.0.0
+
+executors:
+  platform-agent:
+    description: The circleci agent container to use when running aws/eks configuration pipelines
+    docker:
+      - image: $ECR_URL/grainger-di-circleci-base-agent:5.3.0
+        aws_auth:
+          aws_access_key_id: $ECR_ACCESS_KEY
+          aws_secret_access_key: $ECR_SECRET_ACCESS_KEY
+    environment:
+      DOCKER_REGISTRY: $ECR_URL
+      BASH_ENV: /root/project/local.env
+
+# yaml anchor filters
+build-master-filter: &build-master-filter
+  branches:
+    only: /master/
+  tags:
+    ignore: /.*/
+
+build-qa-filter: &build-qa-filter
+  branches:
+    ignore: /.*/
+  tags:
+    only: /^\d+\.\d+\.\d+-rc\d+$/
+
+build-prod-filter: &build-prod-filter
+  branches:
+    ignore: /.*/
+  tags:
+    only: /^\d+\.\d+\.\d+$/
+
+workflows:
+  version: 2
+  dev-release:
+    jobs:
+      - app-release/build-and-push-image:
+          name: build-db-migration-image
+          team-name: *team
+          <<: *circle-ci-service-account
+          <<: *circle-ci-context
+          dockerfile: Dockerfile.snowflake
+          image: ${CIRCLE_PROJECT_REPONAME}-migrations
+          enable-docker-layer-caching: true
+          filters: *build-master-filter
+      - deploy:
+          name: dev-deploy-db-migration
+          requires:
+            - build-db-migration-image
+          <<: *circle-ci-context
+          circle-ci-service-account: $SERVICE_USER_GDA
+          cluster-name: di-nonprod-cluster
+          cluster-subdomain: .nonprod
+          aws-region: *nonprod-aws-region
+          namespace: gda
+          environment: dev
+          team: *team
+          platform-services-environment: services
+          snowflake-account: wwgraingerdev.us-east-1
+          snowflake-warehouse: GDA_WH_XS
+          snowflake-s3-namespace: dev
+      - app-release/tag-release-candidate:
+          name: tag-dev-commit-auto-increment
+          requires:
+            - dev-deploy-db-migration
+          <<: *circle-ci-service-account
+          vault-bitbucket-key-path: "gda/bitbucket"
+          <<: *circle-ci-context
+          filters: *build-master-filter
+  qa-release:
+    jobs:
+      - app-release/promote-image-with-tag:
+          name: publish-tagged-qa-image
+          <<: *circle-ci-service-account
+          <<: *circle-ci-context
+          team-name: *team
+          image: ${CIRCLE_PROJECT_REPONAME}-migrations
+          filters: *build-qa-filter
+      - approve-qa-deploy:
+          type: approval
+          requires:
+            - publish-tagged-qa-image
+          filters: *build-qa-filter
+      - deploy:
+          name: qa-deploy-db-migration
+          requires:
+            - approve-qa-deploy
+          <<: *circle-ci-context
+          circle-ci-service-account: $SERVICE_USER_GDA
+          cluster-name: di-nonprod-cluster
+          cluster-subdomain: .nonprod
+          aws-region: *nonprod-aws-region
+          namespace: gda
+          environment: qa
+          team: *team
+          platform-services-environment: services
+          snowflake-account: wwgraingerqa.us-east-1
+          snowflake-warehouse: GDA_WH_XS
+          snowflake-s3-namespace: qa
+          filters: *build-qa-filter
+      - app-release/tag-release:
+          name: tag-release-commit-remove-rc-number
+          requires:
+            - qa-deploy-db-migration
+          <<: *circle-ci-service-account
+          vault-bitbucket-key-path: "gda/bitbucket"
+          <<: *circle-ci-context
+          filters: *build-qa-filter
+  prod-release:
+    jobs:
+      - app-release/promote-image-with-tag:
+          name: publish-tagged-prod-image
+          <<: *circle-ci-service-account
+          <<: *circle-ci-context
+          team-name: *team
+          image: ${CIRCLE_PROJECT_REPONAME}-migrations
+          filters: *build-prod-filter
+      - approve-prod-deploy:
+          type: approval
+          requires:
+            - publish-tagged-prod-image
+          filters: *build-prod-filter
+      - deploy:
+          name: prod-deploy-db-migration
+          requires:
+            - approve-prod-deploy
+          <<: *circle-ci-context
+          circle-ci-service-account: $SERVICE_USER_GDA
+          cluster-name: di-prod-cluster
+          cluster-subdomain:
+          aws-region: *prod-aws-region
+          namespace: gda
+          environment: prod
+          team: *team
+          platform-services-environment: services
+          snowflake-account: wwgrainger.us-east-1
+          snowflake-warehouse: GDA_WH_XS
+          snowflake-s3-namespace: prod
+          filters: *build-prod-filter
+
+# --------------------------------
+# app specific jobs start here.
+# --------------------------------
+jobs:
+  deploy:
+    description: |
+      Deploys image verstion to specified cluster and region
+    executor: platform-agent
+    environment:
+      ENV_NAME: << parameters.environment >>
+    parameters:
+      circle-ci-service-account:
+        description: service account for team
+        type: string
+      cluster-name:
+        description: target cluster for the deploy
+        type: enum
+        enum: ["di-preview-cluster", "di-nonprod-cluster", "di-prod-cluster"]
+      cluster-subdomain:
+        description: subdomain being managed by external-dns inside the cluster. Prod is blank
+        type: enum
+        enum: [".preview", ".nonprod", ""]
+        default: ""
+      java_enable_debug:
+        description: start app with remote debug enabled on port 5005
+        type: boolean
+        default: false
+      ecr-url:
+        description: ECR url
+        type: string
+        default: $ECR_URL
+      db-host-name:
+        description: external name for database
+        type: string
+        default: ""
+      hostname:
+        description: DNS hostname to prepend to cluster-subdomain and TLD
+        type: string
+        default: ""
+      aws-region:
+        description: target region of the cluster
+        type: string
+        default: ""
+      namespace:
+        description: target k8s namespace
+        type: string
+      environment:
+        description: what environment to deploy to
+        type: string
+      team:
+        description: name of team
+        type: string
+      platform-services-environment:
+        description: environment of the platform services
+        type: enum
+        enum: ["preview-services", "services"]
+      image-tag:
+        description: image tag to be used when deploying, defaults to commit SHA1
+        default: $CIRCLE_SHA1
+        type: string
+      snowflake-account:
+        description: The snowflake account identifier
+        type: string
+      snowflake-warehouse:
+        description: The warehouse the database will run in
+        type: string
+      snowflake-s3-namespace:
+        description: The AWS s3 bucket namespace used to map data stages
+        type: string
+    steps:
+      - checkout
+      - common-tasks/vault-login:
+          circle-ci-service-account: << parameters.circle-ci-service-account >>
+      - common-tasks/setup-aws-credentials:
+          aws-region: << parameters.aws-region >>
+          environment: << parameters.environment >>
+          team-name: << parameters.team >>
+      - common-tasks/setup-eks-credentials:
+          cluster-name: << parameters.cluster-name >>
+          aws-region: << parameters.aws-region >>
+      - common-tasks/ecr-login
+      - run:
+          name: fetch app secrets from vault
+          command: |
+            DB_USERNAME=$(vault kv get -field db-user secret/gda/<< parameters.environment >>/flyway)
+            DB_PASSWORD=$(vault kv get -field db-password secret/gda/<< parameters.environment >>/flyway)
+            S3_ACCESS_KEY_ID=$(vault kv get -field aws_access_key_id secret/gda/dp/grainger.gda.<< parameters.environment >>.svc)
+            S3_SECRET_ACCESS_KEY=$(vault kv get -field aws_secret_access_key secret/gda/dp/grainger.gda.<< parameters.environment >>.svc)
+            PROD_AWS_ACCESS_KEY_ID=$(vault kv get -field aws_access_key_id secret/gda/dp/grainger.gda.prod.svc )
+            PROD_AWS_SECRET_ACCESS_KEY=$(vault kv get -field aws_secret_access_key secret/gda/dp/grainger.gda.prod.svc )
+            echo "export DB_USERNAME=$DB_USERNAME" >> $BASH_ENV
+            echo "export DB_PASSWORD='$DB_PASSWORD'" >> $BASH_ENV
+            echo "export S3_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID" >> $BASH_ENV
+            echo "export S3_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY" >> $BASH_ENV
+            echo "export PROD_AWS_ACCESS_KEY_ID=$PROD_AWS_ACCESS_KEY_ID" >> $BASH_ENV
+            echo "export PROD_AWS_SECRET_ACCESS_KEY=$PROD_AWS_SECRET_ACCESS_KEY" >> $BASH_ENV
+      - run:
+          name: configure db secrets
+          command: |
+            kubectl delete secret $CIRCLE_PROJECT_REPONAME-$ENV_NAME-db-credentials \
+              --ignore-not-found \
+              -n << parameters.namespace >>-<< parameters.environment >>
+
+            kubectl create secret generic $CIRCLE_PROJECT_REPONAME-$ENV_NAME-db-credentials \
+              --from-literal=DB_USERNAME=$DB_USERNAME \
+              --from-literal=DB_PASSWORD=$DB_PASSWORD \
+              -n << parameters.namespace >>-<< parameters.environment >>
+
+            kubectl delete secret $CIRCLE_PROJECT_REPONAME-$ENV_NAME-s3-credentials \
+              --ignore-not-found \
+              -n << parameters.namespace >>-<< parameters.environment >>
+
+            kubectl create secret generic $CIRCLE_PROJECT_REPONAME-$ENV_NAME-s3-credentials \
+              --from-literal=S3_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID \
+              --from-literal=S3_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY \
+              --from-literal=PROD_AWS_ACCESS_KEY_ID=$PROD_AWS_ACCESS_KEY_ID \
+              --from-literal=PROD_AWS_SECRET_ACCESS_KEY=$PROD_AWS_SECRET_ACCESS_KEY \
+              -n << parameters.namespace >>-<< parameters.environment >>
+      - run:
+          name: prepare database configuration
+          command: |
+            pyrender \
+              -t deployment/$CIRCLE_PROJECT_REPONAME-migrations.yml.jinja2 \
+              -o deployment/$CIRCLE_PROJECT_REPONAME-migrations.yml \
+              dbSecret=$CIRCLE_PROJECT_REPONAME-$ENV_NAME-db-credentials \
+              s3Secret=$CIRCLE_PROJECT_REPONAME-$ENV_NAME-s3-credentials \
+              tag=<< parameters.image-tag >> \
+              ecr_url=<< parameters.ecr-url >> \
+              namespace=<< parameters.namespace >> \
+              environment=<< parameters.environment >> \
+              snowflakeAccount=<< parameters.snowflake-account >> \
+              snowflakeWarehouse=<< parameters.snowflake-warehouse >> \
+              s3Namespace=<< parameters.snowflake-s3-namespace >> \
+      - compliance/kiali-validations:
+          filename: deployment/$CIRCLE_PROJECT_REPONAME-migrations.yml
+      - run:
+          name: delete gda-database-migrations-job job
+          command: |
+            kubectl delete job gda-database-migrations-job --ignore-not-found -n \
+              << parameters.namespace >>-<< parameters.environment >>
+      - run:
+          name: deploy db migration service
+          command: |
+            kubectl apply --dry-run -f deployment/$CIRCLE_PROJECT_REPONAME-migrations.yml \
+              -n << parameters.namespace >>-<< parameters.environment >> && \
+            kubectl apply -f deployment/$CIRCLE_PROJECT_REPONAME-migrations.yml \
+              -n << parameters.namespace >>-<< parameters.environment >>
+
+            until [ $(kubectl -n << parameters.namespace >>-<< parameters.environment >> \
+              get jobs gda-database-migrations-job \
+              -o jsonpath='{.status.conditions[0].type}' | grep -c 'Complete\|Failed') -eq 1 ]; \
+            do \
+              echo "Waiting for job to finish..."; \
+              sleep 5; \
+            done
+      - run:
+          name: copy migration logs to artifacts
+          command: |
+            kubectl -n << parameters.namespace >>-<< parameters.environment >> logs \
+              $(kubectl -n << parameters.namespace >>-<< parameters.environment >> \
+                get pods --selector=job-name=gda-database-migrations-job \
+                --output=jsonpath='{.items[0].metadata.name}') > /tmp/results.txt
+      - store_artifacts:
+          path: /tmp/results.txt
+          destination: migrations/results.txt
+      - run:
+          name: check migrations for success
+          command: |
+            if [ "$(kubectl -n << parameters.namespace >>-<< parameters.environment >> \
+              get jobs gda-database-migrations-job \
+              -o jsonpath='{.status.conditions[0].type}')" == "Failed" ]; \
+            then \
+              exit 1; \
+            fi
