@@ -1,0 +1,65 @@
+FROM ubuntu:20.04
+
+ARG FLYWAY_VERSION=6.1.4
+ARG SNOWFLAKE_JDBC_VERSION=3.11.1
+ARG SNOWFLAKE_DOWNLOAD_MD5_HASH=c092b0d71bab1fc3cdeca1ccd49efbaa
+ARG SNOWSQL_BOOTSTRAP_VERSION=1.2
+ARG SNOWSQL_MINOR_VERSION=${SNOWSQL_BOOTSTRAP_VERSION}.2
+
+# snowsql predefined environment variables for installing the CLI
+ENV SNOWSQL_DEST /usr/local/bin
+ENV SNOWSQL_LOGIN_SHELL /root/.profile
+ENV LC_ALL C.UTF-8
+ENV LANG C.UTF-8
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+COPY requirements.txt .
+
+# Install needed packages
+RUN apt-get -y update \
+  && apt-get -y --no-install-recommends install curl=7.68.0-1ubuntu2.12 \
+  && apt-get -y --no-install-recommends install default-jre=2:1.11-72 \
+  && apt-get -y --no-install-recommends install python3-pip=20.0.2-5ubuntu1.6 \
+  && apt-get -y --no-install-recommends install python3-setuptools=45.2.0-1 \
+  && apt-get -y --no-install-recommends install python3=3.8.2-0ubuntu2 \
+  && apt-get -y --no-install-recommends install jq=1.6-1ubuntu0.20.04.1 \
+  && pip3 install -r requirements.txt \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install snowsql and verify the version.
+# Note auto-upgrade is part of the installer so the patch version will vary, e.g. 1.2.3, 1.2.4, ...
+RUN curl -L https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/${SNOWSQL_BOOTSTRAP_VERSION}/linux_x86_64/snowsql-${SNOWSQL_MINOR_VERSION}-linux_x86_64.bash -o /tmp/snowsql-${SNOWSQL_MINOR_VERSION}-linux_x86_64.bash
+RUN chmod +x /tmp/snowsql-${SNOWSQL_MINOR_VERSION}-linux_x86_64.bash
+RUN /tmp/snowsql-1.2.2-linux_x86_64.bash
+RUN snowsql --version
+
+# Install flyway
+RUN adduser --system --home /flyway --disabled-password --group flyway
+ENV FLYWAY_HOME /flyway
+WORKDIR /flyway
+USER flyway
+
+RUN curl -L https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${FLYWAY_VERSION}/flyway-commandline-${FLYWAY_VERSION}.tar.gz -o flyway-commandline-${FLYWAY_VERSION}.tar.gz \
+  && tar -xzf flyway-commandline-${FLYWAY_VERSION}.tar.gz --strip-components=1 \
+  && rm flyway-commandline-${FLYWAY_VERSION}.tar.gz
+
+# Remove any snowflake drivers and install the version we specified
+RUN rm -f /flyway/drivers/snowflake*
+RUN curl -L https://repo1.maven.org/maven2/net/snowflake/snowflake-jdbc/${SNOWFLAKE_JDBC_VERSION}/snowflake-jdbc-${SNOWFLAKE_JDBC_VERSION}.jar -o /flyway/drivers/snowflake-jdbc-${SNOWFLAKE_JDBC_VERSION}.jar
+RUN echo "${SNOWFLAKE_DOWNLOAD_MD5_HASH} */flyway/drivers/snowflake-jdbc-${SNOWFLAKE_JDBC_VERSION}.jar" | md5sum -c -
+
+# Copy our files to flyway
+RUN mkdir -p /flyway/scripts
+RUN mkdir -p /flyway/databases
+RUN mkdir -p /flyway/warehouses
+COPY --chown=flyway databases /flyway/databases
+COPY --chown=flyway warehouses /flyway/warehouses
+COPY --chown=flyway conf /flyway/conf
+COPY --chown=flyway scripts /flyway/scripts
+COPY --chown=flyway rbac /flyway/rbac
+RUN rm -rf /flyway/sql
+
+ENTRYPOINT ["python3", "/flyway/scripts/entry.py"]
+
